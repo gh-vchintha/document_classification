@@ -73,12 +73,16 @@ import pyarrow.parquet as pq
 from PIL import Image
 from openai import OpenAI  # used only in transcribe_handwritten()
 from pdf2image import convert_from_bytes, pdfinfo_from_bytes
+from dotenv import load_dotenv
+import os
+
+load_dotenv()  # take environment variables from .env
 
 # Guardant PoC bits (assumed available)
-from poc.client import api_key
-from poc.promts import EXTRACTION_PROMPT
-from poc.promts import get_benchmark_prompt, classify_v3_prompt
-
+# from client import api_key
+from promts import EXTRACTION_PROMPT
+from promts import get_benchmark_prompt, classify_v3_prompt
+api_key = os.environ["api_key"]
 openai_client = OpenAI(api_key=api_key)
 import cv2
 import numpy as np
@@ -547,6 +551,7 @@ class HandwritingExtractor:
           3) Return row of strings: pdf_file, results, classification, job_run_time
         """
         from concurrent.futures import ThreadPoolExecutor
+        max_pages_to_process= 10
 
         def _load_pdf(path: str) -> bytes:
             return get_bytes_from_s3(path) if path.lower().startswith("s3://") else open(path, "rb").read()
