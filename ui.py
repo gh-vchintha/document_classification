@@ -19,37 +19,9 @@ import pandas as pd
 import streamlit as st
 
 # ======================================================================================
-# Import resolver (works when this file is inside ./poc/)
+# Import HandwritingExtractor directly from local file
 # ======================================================================================
-HandwritingExtractor = None
-
-def _resolve_extractor(project_root: Optional[str] = None):
-    """Try to import HandwritingExtractor from several locations.
-    Adds project_root and project_root/poc to sys.path first.
-    Returns (cls, last_error)."""
-    global HandwritingExtractor
-    if not project_root:
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-
-    for p in (project_root, os.path.join(project_root, "poc")):
-        if os.path.isdir(p) and p not in sys.path:
-            sys.path.insert(0, p)
-
-    attempts = [
-        ("poc.ocr_only_v2", "HandwritingExtractor"),  # preferred
-        ("ocr_only_v2", "HandwritingExtractor"),
-        ("poc.main", "HandwritingExtractor"),
-        ("main", "HandwritingExtractor"),
-    ]
-    last_err = None
-    for mod_name, attr in attempts:
-        try:
-            mod = __import__(mod_name, fromlist=[attr])
-            HandwritingExtractor = getattr(mod, attr)
-            return HandwritingExtractor, None
-        except Exception as e:
-            last_err = e
-    return None, last_err
+from ocr_only_v2 import HandwritingExtractor
 
 # ======================================================================================
 # Constants & dirs
@@ -188,6 +160,19 @@ def _json_default(o: Any):
         except Exception:
             pass
     return str(o)
+
+def dataframe_full_width(df, **kwargs):
+    """
+    Prefer the new API (width='stretch'); fall back to use_container_width=True
+    on older Streamlit builds that require an integer width.
+    """
+    try:
+        # New API (may raise TypeError on older versions)
+        return st.dataframe(df, width="stretch", **kwargs)
+    except TypeError:
+        # Old API
+        return st.dataframe(df, use_container_width=True, **kwargs)
+
 
 # Flatten results to a simple list[dict] regardless of pipeline shape
 def _flatten_results(results: List[Any]) -> List[Dict[str, Any]]:
@@ -340,7 +325,9 @@ def tab_dashboard():
         "size": [_human_size(p.size) for p in st.session_state.pdfs],
         "status": [p.status for p in st.session_state.pdfs],
     }
-    st.dataframe(pd.DataFrame(data), hide_index=True, use_container_width=True)
+    dataframe_full_width(pd.DataFrame(data), hide_index=True)
+
+    # st.dataframe(pd.DataFrame(data), hide_index=True, width="stretch")
 
     total = len(st.session_state.pdfs)
     done = sum(1 for p in st.session_state.pdfs if p.status == "Done")
@@ -431,7 +418,9 @@ def tab_per_pdf():
             return
 
         st.write("**Rows for this file**")
-        st.dataframe(pd.DataFrame(subset), use_container_width=True, hide_index=True)
+        # st.dataframe(pd.DataFrame(subset), width="stretch", hide_index=True)
+        dataframe_full_width(pd.DataFrame(subset), hide_index=True)
+
 
         # Per-file downloads (unique keys per file)
         jsonl_bytes = "\n".join(
@@ -463,7 +452,7 @@ def tab_results():
         return
 
     df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    dataframe_full_width(df, hide_index=True)
 
     # Downloads (all results)
     csv_bytes = df.to_csv(index=False).encode("utf-8")
@@ -553,11 +542,6 @@ def main():
         if not st.session_state.pdfs:
             st.warning("Please upload at least one PDF.")
         else:
-            extractor_cls, err = _resolve_extractor(st.session_state.get("project_root"))
-            if extractor_cls is None:
-                st.error("Couldn't import HandwritingExtractor. Last error:\n\n" + str(err))
-                return
-
             st.session_state.job = {
                 "id": uuid.uuid4().hex[:8],
                 "status": "running",
@@ -599,7 +583,7 @@ def main():
                     target=_run_pipeline_in_thread,
                     args=(
                         pdf_paths, True, actions["max_pages"],
-                        actions["settings_env"], extractor_cls,
+                        actions["settings_env"], HandwritingExtractor,
                         res, done_event
                     ),
                     daemon=True,

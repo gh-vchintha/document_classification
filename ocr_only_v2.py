@@ -69,7 +69,10 @@ from PIL import Image
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pandas as pd
+from dotenv import load_dotenv
+import os
 
+load_dotenv()
 import cv2
 import numpy as np
 
@@ -79,8 +82,7 @@ try:
     # Guardant PoC credential shim
     try:
         # Prefer your existing api_key wiring if available
-        from poc.client import api_key as _GH_API_KEY  # type: ignore
-        openai_client = OpenAI(api_key=_GH_API_KEY)
+        openai_client = OpenAI(api_key=os.environ["api_key"])
     except Exception:
         openai_client = OpenAI()  # falls back to env OPENAI_API_KEY
 except Exception as _e:
@@ -89,7 +91,7 @@ except Exception as _e:
 # ---------------- Guardant PoC prompt & helpers --------------------------------------
 # Keep absolute import for your layout, but allow fallback to relative if needed
 try:
-    from poc.promts import EXTRACTION_PROMPT, classify_v3_prompt  # type: ignore
+    from promts import EXTRACTION_PROMPT, classify_v3_prompt  # type: ignore
 except Exception:
     # fallback if running from inside poc/
     from promts import EXTRACTION_PROMPT, classify_v3_prompt  # type: ignore

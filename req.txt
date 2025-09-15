@@ -1,2 +1,7 @@
 openai
 streamlit
+boto3
+pdf2image
+pillow
+opencv-python
+watchdog
