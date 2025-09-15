@@ -1,1 +1,6 @@
 .env
+/.idea/codeStyles/codeStyleConfig.xml
+/.idea/document_classification.iml
+/.idea/misc.xml
+/.idea/vcs.xml
+/client.py
