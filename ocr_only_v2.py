@@ -137,6 +137,13 @@ DEBUG_DIR = os.environ.get(
 )
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
+# Artifacts dir (for UI chat + persistence)
+ARTIFACTS_DIR = os.environ.get(
+    "ARTIFACTS_DIR",
+    os.path.join(os.path.abspath(os.path.dirname(__file__)), ".app_cache", "artifacts"),
+)
+os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+
 # --------------------------------------------------------------------------------------
 # Parquet schema (kept for compatibility; not required by UI)
 # --------------------------------------------------------------------------------------
@@ -579,6 +586,41 @@ class HandwritingExtractor:
         def _load_pdf(path: str) -> bytes:
             return get_bytes_from_s3(path) if path.lower().startswith("s3://") else open(path, "rb").read()
 
+        def _norm_patient_name(name: Optional[str]) -> Optional[str]:
+            if not name or not isinstance(name, str):
+                return None
+            import re
+            s = name.strip().lower()
+            s = re.sub(r"[^\w\s]", " ", s)
+            s = re.sub(r"\s+", " ", s)
+            return s or None
+
+        def _parse_page_range(pt: Optional[str]) -> List[Tuple[int, int]]:
+            spans: List[Tuple[int, int]] = []
+            if not pt or not isinstance(pt, str):
+                return spans
+            # support formats like "3-5" or "7"
+            parts = [pt]
+            if "," in pt:
+                parts = [p.strip() for p in pt.split(",") if p.strip()]
+            for part in parts:
+                if "-" in part:
+                    a, b = part.split("-", 1)
+                    try:
+                        start = int(a.strip()); end = int(b.strip())
+                        if start > 0 and end >= start:
+                            spans.append((start, end))
+                    except Exception:
+                        continue
+                else:
+                    try:
+                        p = int(part.strip())
+                        if p > 0:
+                            spans.append((p, p))
+                    except Exception:
+                        continue
+            return spans
+
         def _one_pdf(pdf_path: str) -> Dict[str, Any]:
             filename_ = os.path.basename(pdf_path)
             try:
@@ -590,7 +632,16 @@ class HandwritingExtractor:
                 extracted = self.process_pdf(pdf_bytes, custom_prompt, max_pages=max_pages_to_process)
 
                 # 2) Build pages (NO truncation) + classify
-                pages = self._build_pages_array_no_trunc(extracted)
+                raw_pages = self._build_pages_array_no_trunc(extracted)
+                # Normalize keys for artifact consumers
+                pages = [
+                    {
+                        "page_no": int(p.get("pageno") or p.get("page_no") or 0),
+                        "raw_text": p.get("rawtext") if "rawtext" in p else p.get("raw_text", ""),
+                        "data": p.get("data", {}) or {},
+                    }
+                    for p in raw_pages
+                ]
                 logger.info("Classify start: %s (pages=%d)", pdf_path, len(extracted))
                 try:
                     with open(os.path.join(DEBUG_DIR, f"{filename_}.txt"), "w", encoding="utf-8") as file:
@@ -606,6 +657,78 @@ class HandwritingExtractor:
 
                 job_run_time = pd.Timestamp.utcnow().tz_convert("UTC")
                 data = self.prepare_payload(classification_json,filename_,str(job_run_time))
+
+                # Persist artifact for UI chat consumption
+                try:
+                    classification_obj: Dict[str, Any] = {}
+                    try:
+                        classification_obj = json.loads(classification_json) if isinstance(classification_json, str) else (classification_json or {})
+                    except Exception:
+                        classification_obj = {}
+
+                    # Normalize document fields for downstream use
+                    documents: List[Dict[str, Any]] = []
+                    raw_docs = []
+                    if isinstance(classification_obj, dict):
+                        raw_docs = classification_obj.get("documents") or []
+                    elif isinstance(classification_obj, list):
+                        raw_docs = classification_obj
+                    for doc in raw_docs or []:
+                        if not isinstance(doc, dict):
+                            continue
+                        ddata = doc.get("d") if isinstance(doc.get("d"), dict) else doc.get("data", {}) or {}
+                        documents.append({
+                            "doc_type": doc.get("t") or doc.get("doc_type") or "",
+                            "page_range": doc.get("pt") or doc.get("page_range") or "",
+                            "summary": doc.get("s") or doc.get("summary") or "",
+                            "data": ddata,
+                        })
+
+                    # Build patient index
+                    patient_index: List[Dict[str, Any]] = []
+                    by_patient: Dict[str, Dict[str, Any]] = {}
+                    for idx, doc in enumerate(documents):
+                        pname = None
+                        d = doc.get("data") or {}
+                        try:
+                            pname = d.get("Patient Name")
+                        except Exception:
+                            pname = None
+                        pname_norm = _norm_patient_name(pname) or "unknown"
+                        spans = _parse_page_range(doc.get("page_range"))
+                        entry = by_patient.get(pname_norm)
+                        if not entry:
+                            entry = {
+                                "patient_name": pname or "Unknown",
+                                "patient_name_norm": pname_norm,
+                                "doc_indices": [],
+                                "page_spans": [],
+                            }
+                            by_patient[pname_norm] = entry
+                        entry["doc_indices"].append(idx)
+                        entry["page_spans"].extend(spans)
+                    patient_index = list(by_patient.values())
+
+                    artifact = {
+                        "filename": filename_,
+                        "created_at": str(job_run_time),
+                        "pages": pages,
+                        "documents": documents,
+                        "patient_index": patient_index,
+                        "env": {
+                            "PDF_RENDER_DPI": PDF_RENDER_DPI,
+                            "PDF_RENDER_FMT": PDF_RENDER_FMT,
+                            "PDF_OCR_MAX_WORKERS": self.max_workers,
+                            "PDF_OCR_MAX_OCR": self.max_ocr_workers,
+                        },
+                    }
+                    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+                    out_path = os.path.join(ARTIFACTS_DIR, f"{filename_}.json")
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        json.dump(artifact, f, ensure_ascii=False)
+                    logger.info("Saved artifact: %s", out_path)
+                except Exception as _e:
+                    logger.warning("Could not save artifact for %s: %s", filename_, _e)
                 return data
 
             except Exception as e:

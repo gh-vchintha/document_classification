@@ -12,11 +12,16 @@ import shutil
 import types
 import threading
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # type: ignore
 
 # ======================================================================================
 # Import HandwritingExtractor directly from local file
@@ -33,6 +38,9 @@ ARTIFACTS_DIR = os.path.join(CACHE_DIR, "artifacts")
 LOGS_DIR = os.path.join(CACHE_DIR, "logs")
 for d in (CACHE_DIR, UPLOAD_DIR, ARTIFACTS_DIR, LOGS_DIR):
     os.makedirs(d, exist_ok=True)
+
+# Chat/QA defaults
+CHAT_OPENAI_MODEL_DEFAULT = os.environ.get("CHAT_OPENAI_MODEL", "gpt-4o-mini")
 
 # ======================================================================================
 # Logging to Streamlit (via queue) — safe for threads
@@ -160,6 +168,20 @@ def _json_default(o: Any):
         except Exception:
             pass
     return str(o)
+
+def _norm_patient_name(name: Optional[str]) -> Optional[str]:
+    if not name or not isinstance(name, str):
+        return None
+    s = name.strip().lower()
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s or None
+
+def _slugify(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "unknown"
 
 def dataframe_full_width(df, **kwargs):
     """
@@ -289,6 +311,11 @@ def sidebar_controls():
         cancel = st.button("⏹️ Cancel", disabled=(st.session_state.job["status"] != "running"))
         reset = st.button("♻️ Reset State")
 
+        # Paths & chat settings
+        st.subheader("Paths & Chat")
+        artifacts_dir = st.text_input("ARTIFACTS_DIR", value=ARTIFACTS_DIR)
+        chat_model = st.text_input("CHAT_OPENAI_MODEL", value=CHAT_OPENAI_MODEL_DEFAULT)
+
         settings_env = {
             "PDF_RENDER_DPI": str(dpi),
             "PDF_RENDER_FMT": str(fmt),
@@ -298,6 +325,8 @@ def sidebar_controls():
             "PDF_OCR_MAX_RETRIES": str(ocr_retries),
             "CLS_MAX_RETRIES": str(cls_retries),
             "LOG_LEVEL": str(log_level),
+            "ARTIFACTS_DIR": str(artifacts_dir),
+            "CHAT_OPENAI_MODEL": str(chat_model),
         }
 
         return {
@@ -310,6 +339,8 @@ def sidebar_controls():
             "settings_env": settings_env,
             "max_pages": int(max_pages) if max_pages > 0 else 100,
             "project_root": proj_root,
+            "artifacts_dir": artifacts_dir,
+            "chat_model": chat_model,
         }
 
 # ======================================================================================
@@ -469,13 +500,162 @@ def tab_results():
         mime="text/csv",
         key="dl_csv_results",
     )
-    c2.download_button(
-        "Download JSONL",
-        data=jsonl_bytes,
-        file_name="results.jsonl",
-        mime="application/json",
-        key="dl_jsonl_results",
-    )
+
+def _list_available_artifacts(artifacts_dir: str) -> List[str]:
+    try:
+        return [f[:-5] for f in os.listdir(artifacts_dir) if f.endswith('.json')]
+    except Exception:
+        return []
+
+def _load_artifact(artifacts_dir: str, filename: str) -> Optional[Dict[str, Any]]:
+    path = os.path.join(artifacts_dir, f"{filename}.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _patient_pages_from_artifact(artifact: Dict[str, Any], patient_name: str) -> List[int]:
+    pages = []
+    pnorm = _norm_patient_name(patient_name) or "unknown"
+    for entry in artifact.get("patient_index", []) or []:
+        if entry.get("patient_name_norm") == pnorm:
+            spans = entry.get("page_spans") or []
+            for a, b in spans:
+                pages.extend(list(range(int(a), int(b) + 1)))
+            break
+    return sorted(set(pages))
+
+def _score_chunks_by_overlap(question: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    qtok = set(re.findall(r"\w+", question.lower()))
+    for ch in chunks:
+        text = (ch.get("text") or "").lower()
+        ttok = set(re.findall(r"\w+", text))
+        overlap = len(qtok & ttok)
+        ch["score"] = overlap
+    return sorted(chunks, key=lambda x: x.get("score", 0), reverse=True)
+
+def _chat_call(model: str, system_prompt: str, user_prompt: str) -> str:
+    if OpenAI is None:
+        raise RuntimeError("OpenAI SDK not available. Check requirements and environment.")
+    client = OpenAI()
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return getattr(resp, "output_text", "").strip()
+    except Exception as e:
+        return f"[error] {e}"
+
+def tab_chat(actions: Dict[str, Any]):
+    st.subheader("Patient Chat (Grounded)")
+    artifacts_dir = actions.get("artifacts_dir") or ARTIFACTS_DIR
+    os.makedirs(artifacts_dir, exist_ok=True)
+
+    rows = _flatten_results(st.session_state.results)
+    if not rows:
+        st.info("No results yet. Run the pipeline first.")
+        return
+
+    processed = sorted({r.get("filename") for r in rows if r.get("filename")})
+    available = [fn for fn in processed if os.path.exists(os.path.join(artifacts_dir, f"{fn}.json"))]
+    if not available:
+        st.warning("No artifacts found yet. After a run completes, artifacts will be saved to ARTIFACTS_DIR for chat.")
+        st.write(f"ARTIFACTS_DIR: `{artifacts_dir}`")
+        return
+
+    sel_file = st.selectbox("Choose a processed PDF", available, key="chat_pdf_select")
+    artifact = _load_artifact(artifacts_dir, sel_file)
+    if not artifact:
+        st.error("Failed to load artifact for this file.")
+        return
+
+    patients = [p.get("patient_name", "Unknown") for p in (artifact.get("patient_index") or [])]
+    patients = sorted(set(patients)) or ["Unknown"]
+    sel_patient = st.selectbox("Choose a patient", patients, key="chat_patient_select")
+
+    # Summary
+    page_nums = _patient_pages_from_artifact(artifact, sel_patient)
+    st.caption(f"Pages attributed to patient: {page_nums if page_nums else 'Unknown'}")
+
+    # Prepare chat state
+    pkey = _norm_patient_name(sel_patient) or "unknown"
+    chat_key = f"chat::{sel_file}::{pkey}"
+    if "chat_histories" not in st.session_state:
+        st.session_state.chat_histories = {}
+    if chat_key not in st.session_state.chat_histories:
+        # try load persisted
+        slug = _slugify(pkey)
+        log_path = os.path.join(artifacts_dir, f"{sel_file}__{slug}__chat.jsonl")
+        hist: List[Dict[str, Any]] = []
+        try:
+            if os.path.exists(log_path):
+                with open(log_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            hist.append(json.loads(line))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        st.session_state.chat_histories[chat_key] = hist
+
+    history = st.session_state.chat_histories[chat_key]
+    for m in history:
+        with st.chat_message(m.get("role", "assistant")):
+            st.write(m.get("content", ""))
+            if m.get("sources"):
+                st.caption(f"Sources: {m.get('sources')}")
+
+    question = st.chat_input("Ask a question about this patient's document…")
+    if question:
+        # Append user message
+        user_msg = {"role": "user", "content": question}
+        history.append(user_msg)
+        with st.chat_message("user"):
+            st.write(question)
+
+        # Retrieval: build chunks from patient pages only
+        page_map = {int(p.get("page_no")): (p.get("raw_text") or "") for p in (artifact.get("pages") or []) if isinstance(p.get("page_no"), int)}
+        candidate_pages = page_nums or sorted(page_map.keys())
+        chunks = [{"page": p, "text": page_map.get(p, "")} for p in candidate_pages]
+        ranked = _score_chunks_by_overlap(question, chunks)
+        topk = ranked[: min(6, len(ranked))]
+        used_pages = [c.get("page") for c in topk if c.get("text")]
+        context = "\n\n".join([f"Page {c['page']}\n{c['text']}" for c in topk if c.get("text")])
+        if not context.strip():
+            context = "No usable context found. If you cannot answer from context, reply with: I don't know based on the provided documents."
+
+        system_prompt = (
+            "You are a careful, grounded assistant. Answer only using the provided context. "
+            "If the answer is not clearly contained in the context, respond exactly: I don't know based on the provided documents. "
+            "Be concise and cite page numbers from the context when possible."
+        )
+        user_prompt = f"Question: {question}\n\nContext:\n{context}"
+
+        model = actions.get("chat_model") or CHAT_OPENAI_MODEL_DEFAULT
+        with st.chat_message("assistant"):
+            answer = _chat_call(model, system_prompt, user_prompt)
+            st.write(answer)
+            if used_pages:
+                st.caption(f"Sources: pages {used_pages}")
+
+        asst_msg = {"role": "assistant", "content": answer, "sources": used_pages}
+        history.append(asst_msg)
+
+        # Persist chat log
+        try:
+            slug = _slugify(pkey)
+            log_path = os.path.join(artifacts_dir, f"{sel_file}__{slug}__chat.jsonl")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(user_msg, ensure_ascii=False) + "\n")
+                f.write(json.dumps(asst_msg, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
 def tab_settings():
     st.subheader("Paths & Presets")
@@ -523,7 +703,7 @@ def main():
         else:
             st.info("No new files (duplicates were ignored).")
 
-    tabs = st.tabs(["Dashboard", "Live Logs", "Per-PDF", "Results", "Settings", "Debug"])
+    tabs = st.tabs(["Dashboard", "Live Logs", "Per-PDF", "Results", "Chat", "Settings", "Debug"])
     with tabs[0]:
         tab_dashboard()
     with tabs[1]:
@@ -533,8 +713,10 @@ def main():
     with tabs[3]:
         tab_results()
     with tabs[4]:
-        tab_settings()
+        tab_chat(actions)
     with tabs[5]:
+        tab_settings()
+    with tabs[6]:
         tab_debug()
 
     # Start / Cancel
