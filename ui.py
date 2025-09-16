@@ -189,12 +189,46 @@ def dataframe_full_width(df, **kwargs):
     on older Streamlit builds that require an integer width.
     """
     try:
-        # New API (may raise TypeError on older versions)
         return st.dataframe(df, width="stretch", **kwargs)
     except TypeError:
-        # Old API
         return st.dataframe(df, use_container_width=True, **kwargs)
 
+# ---------- Stable artifacts for download buttons ----------
+import hashlib
+def _sanitize(s: str) -> str:
+    keep = "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in s)
+    return keep.strip("_") or "file"
+
+def _write_artifacts(name: str, rows: List[Dict[str, Any]]) -> tuple[str, str]:
+    """
+    Write CSV & JSONL once into ARTIFACTS_DIR and return their file paths.
+    Rewrites only if content changed (hash).
+    """
+    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+    base = _sanitize(name)
+    csv_path = os.path.join(ARTIFACTS_DIR, f"{base}.csv")
+    jsonl_path = os.path.join(ARTIFACTS_DIR, f"{base}.jsonl")
+
+    # Build strings once
+    df = pd.DataFrame(rows)
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    jsonl_str = "\n".join(json.dumps(r, ensure_ascii=False, default=_json_default) for r in rows)
+    jsonl_bytes = jsonl_str.encode("utf-8")
+
+    # Idempotent write using content hash
+    def _safe_write(path: str, data: bytes):
+        h_new = hashlib.sha1(data).hexdigest()
+        h_old = None
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                h_old = hashlib.sha1(f.read()).hexdigest()
+        if h_new != h_old:
+            with open(path, "wb") as f:
+                f.write(data)
+
+    _safe_write(csv_path, csv_bytes)
+    _safe_write(jsonl_path, jsonl_bytes)
+    return csv_path, jsonl_path
 
 # Flatten results to a simple list[dict] regardless of pipeline shape
 def _flatten_results(results: List[Any]) -> List[Dict[str, Any]]:
@@ -379,25 +413,27 @@ def tab_dashboard():
     if results_flat:
         with st.expander("Last Run Artifacts"):
             df = pd.DataFrame(results_flat)
-            csv_bytes = df.to_csv(index=False).encode("utf-8")
-            jsonl_bytes = "\n".join(
-                json.dumps(row, ensure_ascii=False, default=_json_default)
-                for row in results_flat
-            ).encode("utf-8")
+            dataframe_full_width(df, hide_index=True)
+
+            csv_path, jsonl_path = _write_artifacts("all_results", results_flat)
+            with open(csv_path, "rb") as f:
+                csv_bytes = f.read()
+            with open(jsonl_path, "rb") as f:
+                jsonl_bytes = f.read()
 
             st.download_button(
                 "Download CSV",
                 data=csv_bytes,
                 file_name="results.csv",
                 mime="text/csv",
-                key="dl_csv_dashboard",
+                key="dl_csv_dashboard_all",
             )
             st.download_button(
                 "Download JSONL",
                 data=jsonl_bytes,
                 file_name="results.jsonl",
                 mime="application/json",
-                key="dl_jsonl_dashboard",
+                key="dl_jsonl_dashboard_all",
             )
 
 def tab_logs():
@@ -449,15 +485,15 @@ def tab_per_pdf():
             return
 
         st.write("**Rows for this file**")
-        # st.dataframe(pd.DataFrame(subset), width="stretch", hide_index=True)
         dataframe_full_width(pd.DataFrame(subset), hide_index=True)
 
-
-        # Per-file downloads (unique keys per file)
-        jsonl_bytes = "\n".join(
-            json.dumps(r, ensure_ascii=False, default=_json_default) for r in subset
-        ).encode("utf-8")
-        csv_bytes = pd.DataFrame(subset).to_csv(index=False).encode("utf-8")
+        # Per-file downloads (stable keys & files)
+        base = f"results_{_sanitize(selected_name)}"
+        csv_path, jsonl_path = _write_artifacts(base, subset)
+        with open(csv_path, "rb") as f:
+            csv_bytes = f.read()
+        with open(jsonl_path, "rb") as f:
+            jsonl_bytes = f.read()
 
         c1, c2 = st.columns(2)
         c1.download_button(
@@ -465,14 +501,14 @@ def tab_per_pdf():
             data=jsonl_bytes,
             file_name=f"{selected_name}_results.jsonl",
             mime="application/json",
-            key=f"dl_jsonl_{uuid.uuid4().hex[:8]}",
+            key=f"dl_jsonl_file_{base}",
         )
         c2.download_button(
             "Download this file's CSV",
             data=csv_bytes,
             file_name=f"{selected_name}_results.csv",
             mime="text/csv",
-            key=f"dl_csv_{uuid.uuid4().hex[:8]}",
+            key=f"dl_csv_file_{base}",
         )
 
 def tab_results():
@@ -485,12 +521,12 @@ def tab_results():
     df = pd.DataFrame(rows)
     dataframe_full_width(df, hide_index=True)
 
-    # Downloads (all results)
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    jsonl_bytes = "\n".join(
-        json.dumps(r, ensure_ascii=False, default=_json_default)
-        for r in rows
-    ).encode("utf-8")
+    # Downloads (all results) — stable keys & files
+    csv_path, jsonl_path = _write_artifacts("all_results", rows)
+    with open(csv_path, "rb") as f:
+        csv_bytes = f.read()
+    with open(jsonl_path, "rb") as f:
+        jsonl_bytes = f.read()
 
     c1, c2 = st.columns(2)
     c1.download_button(
@@ -498,7 +534,14 @@ def tab_results():
         data=csv_bytes,
         file_name="results.csv",
         mime="text/csv",
-        key="dl_csv_results",
+        key="dl_csv_results_all",
+    )
+    c2.download_button(
+        "Download JSONL",
+        data=jsonl_bytes,
+        file_name="results.jsonl",
+        mime="application/json",
+        key="dl_jsonl_results_all",
     )
 
 def _list_available_artifacts(artifacts_dir: str) -> List[str]:
