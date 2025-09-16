@@ -392,8 +392,6 @@ def tab_dashboard():
     }
     dataframe_full_width(pd.DataFrame(data), hide_index=True)
 
-    # st.dataframe(pd.DataFrame(data), hide_index=True, width="stretch")
-
     total = len(st.session_state.pdfs)
     done = sum(1 for p in st.session_state.pdfs if p.status == "Done")
     error = sum(1 for p in st.session_state.pdfs if p.status == "Error")
@@ -580,9 +578,9 @@ def _score_chunks_by_overlap(question: str, chunks: List[Dict[str, Any]]) -> Lis
 
 def _chat_call(model: str, system_prompt: str, user_prompt: str) -> str:
     if OpenAI is None:
-        raise RuntimeError("OpenAI SDK not available. Check requirements and environment.")
-    client = OpenAI()
+        return "I don't know based on the provided documents."
     try:
+        client = OpenAI()
         resp = client.responses.create(
             model=model,
             input=[
@@ -590,9 +588,9 @@ def _chat_call(model: str, system_prompt: str, user_prompt: str) -> str:
                 {"role": "user", "content": user_prompt},
             ],
         )
-        return getattr(resp, "output_text", "").strip()
-    except Exception as e:
-        return f"[error] {e}"
+        return getattr(resp, "output_text", "").strip() or "I don't know based on the provided documents."
+    except Exception:
+        return "I don't know based on the provided documents."
 
 def tab_chat(actions: Dict[str, Any]):
     st.subheader("Patient Chat (Grounded)")
@@ -723,6 +721,41 @@ def tab_debug():
     st.write("# Log lines:", len(st.session_state.log_lines))
 
 # ======================================================================================
+# Finalization helper — addresses “backend done but UI not updating” race
+# ======================================================================================
+def _finalize_if_done() -> bool:
+    """
+    Finalize the job if the worker is finished.
+    We consider the job done if either:
+      - worker_done_event.is_set(), or
+      - the runner_thread is no longer alive (fallback).
+    Returns True if we finalized and triggered a rerun.
+    """
+    res = st.session_state.worker_result or {}
+    is_done = False
+
+    if st.session_state.worker_done_event and st.session_state.worker_done_event.is_set():
+        is_done = True
+    elif st.session_state.runner_thread and not st.session_state.runner_thread.is_alive():
+        # Fallback in case the event was missed or the object changed across reruns
+        is_done = True
+
+    if is_done:
+        rows = res.get("rows")
+        if rows is None:
+            rows = []
+        st.session_state.results = rows
+        st.session_state.job["status"] = "error" if res.get("status") == "error" else "done"
+        st.session_state.job["end_ts"] = time.time()
+        if st.session_state.log_handler:
+            _detach_logging(st.session_state.log_handler)
+            st.session_state.log_handler = None
+        st.rerun()
+        return True
+
+    return False
+
+# ======================================================================================
 # Main
 # ======================================================================================
 def main():
@@ -812,6 +845,7 @@ def main():
                         res, done_event
                     ),
                     daemon=True,
+                    name="ocr-classify-worker",
                 )
                 st.session_state.runner_thread = t
                 t.start()
@@ -824,18 +858,11 @@ def main():
 
     # While running, poll worker completion and finalize in the main thread
     if st.session_state.job["status"] == "running":
-        if st.session_state.worker_done_event and st.session_state.worker_done_event.is_set():
-            res = st.session_state.worker_result or {}
-            if res.get("rows") is not None:
-                st.session_state.results = res.get("rows") or []
-            st.session_state.job["status"] = "error" if res.get("status") == "error" else "done"
-            st.session_state.job["end_ts"] = time.time()
-            if st.session_state.log_handler:
-                _detach_logging(st.session_state.log_handler)
-                st.session_state.log_handler = None
-            st.rerun()
-        else:
+        # Try to finalize if the worker has finished (event or thread dead)
+        if not _finalize_if_done():
+            # Small pause to avoid rapid-fire reruns that can starve the worker
             st.toast("Job running… logs will update live.")
+            time.sleep(0.35)
             st.rerun()
 
 if __name__ == "__main__":
