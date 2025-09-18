@@ -551,6 +551,7 @@ class HandwritingExtractor:
                 "doc_type": doc.get("t", ""),
                 "page_range": doc.get("pt", ""),
                 "job_run_time": job_run_time,
+                "summary": doc.get("s", ""),
             }
 
             # Optional field mapping

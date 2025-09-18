@@ -615,7 +615,11 @@ def tab_chat(actions: Dict[str, Any]):
         st.error("Failed to load artifact for this file.")
         return
 
-    patients = [p.get("patient_name", "Unknown") for p in (artifact.get("patient_index") or [])]
+    patients = []
+    for p in (artifact.get("patient_index") or []):
+        name = p.get("patient_name", "Unknown")
+        if not isinstance(name, list):
+            patients.append(name)
     patients = sorted(set(patients)) or ["Unknown"]
     sel_patient = st.selectbox("Choose a patient", patients, key="chat_patient_select")
 
