@@ -118,8 +118,8 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 NOVA_MODEL_ID = os.environ.get("NOVA_MODEL_ID", "us.amazon.nova-pro-v1:0")
 CLASSIFICATION_MODEL_ID = os.environ.get("CLASSIFICATION_MODEL_ID", "us.amazon.nova-premier-v1:0")
 
-PDF_RENDER_DPI = int(os.environ.get("PDF_RENDER_DPI", "220"))
-PDF_RENDER_FMT = os.environ.get("PDF_RENDER_FMT", "jpeg")  # jpeg|png
+PDF_RENDER_DPI = int(os.environ.get("PDF_RENDER_DPI", "600"))
+PDF_RENDER_FMT = os.environ.get("PDF_RENDER_FMT", "png")  # jpeg|png
 
 BEDROCK_READ_TIMEOUT = int(os.environ.get("BEDROCK_READ_TIMEOUT", "300"))
 BEDROCK_CONNECT_TIMEOUT = int(os.environ.get("BEDROCK_CONNECT_TIMEOUT", "10"))

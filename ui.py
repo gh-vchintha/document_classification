@@ -327,19 +327,9 @@ def sidebar_controls():
         st.subheader("Knobs")
         col1, col2 = st.columns(2)
         with col1:
-            dpi = st.number_input("PDF_RENDER_DPI", value=350, min_value=72, max_value=600, step=10)
-            fmt = st.selectbox("PDF_RENDER_FMT", ["jpeg", "png"], index=1)
             max_pages = st.number_input("Max pages (0 = 100)", value=15, min_value=0, step=1)
-            log_level = st.selectbox("LOG_LEVEL", ["DEBUG", "INFO", "WARNING", "ERROR"], index=1)
-        with col2:
-            max_workers = st.number_input("PDF_OCR_MAX_WORKERS", value=6, min_value=1, max_value=64)
-            max_ocr = st.number_input("PDF_OCR_MAX_OCR", value=4, min_value=1, max_value=128)
-            max_pdfs = st.number_input("PDF_OCR_MAX_PDFS", value=3, min_value=1, max_value=64)
-            ocr_retries = st.number_input("PDF_OCR_MAX_RETRIES", value=4, min_value=0, max_value=10)
 
         col3, _ = st.columns(2)
-        with col3:
-            cls_retries = st.number_input("CLS_MAX_RETRIES", value=3, min_value=0, max_value=10)
 
         start = st.button("▶️ Start Job", type="primary")
         cancel = st.button("⏹️ Cancel", disabled=(st.session_state.job["status"] != "running"))
@@ -351,14 +341,6 @@ def sidebar_controls():
         chat_model = st.text_input("CHAT_OPENAI_MODEL", value=CHAT_OPENAI_MODEL_DEFAULT)
 
         settings_env = {
-            "PDF_RENDER_DPI": str(dpi),
-            "PDF_RENDER_FMT": str(fmt),
-            "PDF_OCR_MAX_WORKERS": str(max_workers),
-            "PDF_OCR_MAX_OCR": str(max_ocr),
-            "PDF_OCR_MAX_PDFS": str(max_pdfs),
-            "PDF_OCR_MAX_RETRIES": str(ocr_retries),
-            "CLS_MAX_RETRIES": str(cls_retries),
-            "LOG_LEVEL": str(log_level),
             "ARTIFACTS_DIR": str(artifacts_dir),
             "CHAT_OPENAI_MODEL": str(chat_model),
         }

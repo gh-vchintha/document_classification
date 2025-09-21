@@ -1,4 +1,4 @@
-EXTRACTION_PROMPT  = f"""
+EXTRACTION_PROMPT = f"""
 You are a VISION LLM extraction engine. Return STRICT JSON ONLY.
 
 INPUT
@@ -15,7 +15,7 @@ TASK
 1) Extract the full raw OCR text of the page as a plain string ("raw_text"):
    • Preserve word order but ignore visual layout (columns, boxes, indentation).
    • Normalize whitespace (collapse repeated spaces/newlines).
-   • Remove meaningless filler or repetitive sequences (e.g., "of california blue" repeated many times, or any word/phrase looped unnaturally).
+   • Remove meaningless filler or repetitive sequences (e.g., a short word or phrase looped unnaturally).
    • Remove meaningless special character runs such as "@@@@@", "###", "***", "---___---", or any long sequence of symbols with no semantic value.
    • If OCR text is mostly unreadable/noise, set "raw_text" to "" (empty string).
 
@@ -27,7 +27,11 @@ TASK
    • "MR ID"
    • "Patient Name"
 
-3) Determine "us_postal_page" (top-level field):
+3) Return "data" as follows:
+   • If values are extracted from a table (grid with column headers/cells aligned in rows), return "data" as a LIST of objects, one object per table row.
+   • Otherwise (letter/paragraph layout), return "data" as a LIST containing a single object.
+
+4) Determine "us_postal_page":
    • Inspect the page visually for USPS/postage indicators (e.g., "United States Postal Service", "USPS", postage indicia/meter, cancellation marks, IMb/Intelligent Mail barcode, facing identification mark, permit imprint, postage paid box, postal routing/zip barcode near address block).
    • Return exactly one of:
      - "start" → page appears to be a mailed cover/envelope/front sheet (dominant address block, postage indicia top-right, minimal body text, return address window, "Return Service Requested").
@@ -35,47 +39,88 @@ TASK
      - "none" → no convincing postal/USPS evidence.
 
 EVIDENCE SOURCES
-- Explicit labels (headers, footers, forms) — allow common variants/synonyms (e.g., "Svc Date" → Date of Service, "MR Number" → MR ID, "Pt Name" → Patient Name).
+- Explicit labels (headers, footers, forms) — allow common variants/synonyms listed below.
 - Tables (row/column headers and cells).
 - Table-like layouts (aligned key: value rows, grids).
 
-RULES
-- General (for Claim ID, Subscriber ID, Date of Service, MR ID, Patient Name)
-  • Map values only if clearly tied to explicit labels, headers, or table/table-like structures, including reasonable label synonyms.
-  • Do NOT assume or guess. If uncertain, omit the field.
-  • If multiple valid values exist for a field, join them with "; ".
-  • If no valid evidence is found, omit that field from "data".
-  • Do not confuse payer/remitter/provider/facility names or organization identifiers with these fields.
-  • "Patient Name" must always be an individual person, not an organization (never map Remitter/Payer/Insurance names).
+LABEL→FIELD SYNONYMS (STRICT)
+Map labels/headers to the canonical fields below. Only use these mappings; prefer exact/near-exact matches (case-insensitive, punctuation-insensitive). When mapped, still enforce each field’s value rules.
 
-Enrollee , Beneficiary name
-- Accession ID
-  • ONLY extract tokens that strictly match the pattern A<digits> (e.g., A123456).
-  • This is the sole allowed form for Accession ID, regardless of label.
-  • Regex requirement: ^A\\d+$
+• Accession ID  ⇐ one of:
+  - "Provider Account #", "Provider Account Number", "Provider Acct #", "Account #", "Acct #"
+  - "Accession ID", "Accession Number", "Accession #", "Accn ID", "Accn #", "Accn No."
+  (VALUE MUST MATCH regex ^A\\d+$ OR ^A\\d+Z\\d{{2}}$)
+
+• Claim ID  ⇐ one of:
+  - "Claim Number", "Claim #", "Claim No.", "Claim ID", "Claim Control Number", "Claim CN"
+
+• Subscriber ID  ⇐ one of:
+  - "Subscriber ID", "Subscriber #", "Subscriber Number", "Sub ID", "Member ID", "Enrollee ID", "Beneficiary ID", "Policy ID"
+
+• Date of Service  ⇐ one of:
+  - "Date of Service", "DOS", "Svc Date", "Service Date", "From Date", "From DOS", "Date(s) of Service"
+
+• MR ID  ⇐ one of:
+  - "MR ID", "MR Number", "MRN", "Medical Record #", "Patient MRN"
+
+• Patient Name  ⇐ one of:
+  - "Patient Name", "Pt Name", "Member Name", "Enrollee", "Beneficiary Name", "Subscriber Name"
+  (Value must be a person’s name; never an organization/payer.)
+
+RULES
+- Accession ID:
+  • ONLY extract tokens that strictly match one of:
+    - ^A\\d+$
+    - ^A\\d+Z\\d{{2}}$
+  • Values not matching these patterns must NOT be used as "Accession ID" even if labels suggest so.
+
+- General (for Claim ID, Subscriber ID, Date of Service, MR ID, Patient Name):
+  • Map values only if clearly tied to explicit labels/headers or table/table-like structures using the synonyms above.
+  • Do NOT assume or guess. If uncertain, omit the field in that object.
+  • If multiple valid values exist for a field within the SAME ROW/object, join them with "; ".
+  • If no valid evidence is found for a field in a row/object, omit that field from that object.
+  • Do not confuse payer/remitter/provider/facility names or organization identifiers with these fields.
+  • "Patient Name" must always be an individual person.
+
+- Row alignment for tables:
+  • When a page contains a table, treat each horizontal row of data under the headers as one object.
+  • Use the header-to-field mapping above to decide which cell populates which canonical field.
+  • If a required header is missing, but a clear synonym header is present, use the synonym.
+  • Ignore decorative/border lines.
+
+- Unreadable Pages:
+  • If image text is not human readable, set exactly:
+    {{
+      "raw_text": "",
+      "data": [],
+      "us_postal_page": "none"
+    }}
 
 OUTPUT FORMAT
 {{
   "raw_text": "<cleaned OCR text or empty string>",
-  "data": {{
-    "Accession ID": "<value>",
-    "Claim ID": "<value>",
-    "Subscriber ID": "<value>",
-    "Date of Service": "<value>",
-    "MR ID": "<value>",
-    "Patient Name": "<value>"
-  }},
+  "data": [
+    {{
+      "Accession ID": "<value>",
+      "Claim ID": "<value>",
+      "Subscriber ID": "<value>",
+      "Date of Service": "<value>",
+      "MR ID": "<value>",
+      "Patient Name": "<value>"
+    }}
+  ],
   "us_postal_page": "start" | "end" | "none"
 }}
 
 REQUIREMENTS
 - Output STRICT JSON ONLY (no markdown, no explanations).
-- "data" may include ONLY the six canonical keys listed above; omit any field not confidently found.
-- Do not invent or infer values. Every value must be supported by a clear label, header, or table/table-like structure (including label synonyms).
-- For "Accession ID", the value MUST match regex: ^A\\d+$ .
-- For "us_postal_page", return one of exactly: "start", "end", "none".
-- If Image is not human readable dont extract any data and set raw_text to "" (empty string) and us_postal_page to "none" and data to {{}} Strictly.
+- "data" must be a LIST. Include ONLY the six canonical keys inside each object; omit missing/uncertain fields.
+- Do not invent or infer values. Every value must be supported by a clear label/header or table/table-like structure (including listed synonyms).
+- For "Accession ID", the value MUST match ^A\\d+$ or ^A\\d+Z\\d{{2}}$.
+- For "us_postal_page", return exactly one of: "start", "end", "none".
+- If image is not human readable, set raw_text to "" and us_postal_page to "none" and data to [] strictly.
 """
+
 
 
 
@@ -718,11 +763,13 @@ Return exactly:
 Now classify: {pages_data}"""
 
 
-
 def classify_v3_prompt(pages_data: str) -> str:
     """
     Build the f-string-safe prompt for grouping PDF pages into documents with a detailed summary.
     Pass in a JSON-serialized pages array as `pages_data`.
+
+    This version supports table-style page data (data = list[objects]) and
+    REQUIRES one classification PER item when a page contains multiple data rows.
     """
     return f"""
 You are a strict JSON-only classifier. Output exactly ONE JSON object and NOTHING else.
@@ -736,20 +783,25 @@ Core principles:
 - "us_postal_page" provides **postal-aware** start/end hints and must be applied **wisely** as described below.
 - Summary uses raw_text + grouped DATA.
 - Omit any keys that would be null/empty from each document's "data" object.
+- **Table requirement:** If any page's `data` contains MULTIPLE row-objects, produce **one separate classification per row** (details below).
 
 INPUT (array of pages)
 Each page object has exactly:
 {{
   "page_no": <int>,
   "raw_text": <string>,
-  "data": {{
-    "Accession ID": <string|null>,
-    "Claim ID": <string|null>,
-    "Subscriber ID": <string|null>,
-    "Date of Service": <string|null>,
-    "MR ID": <string|null>,
-    "Patient Name": <string|null>
-  }},
+  "data": [
+    {{
+      "Accession ID": <string|null>,
+      "Claim ID": <string|null>,
+      "Subscriber ID": <string|null>,
+      "Date of Service": <string|null>,
+      "MR ID": <string|null>,
+      "Patient Name": <string|null>
+    }}
+    // zero or more additional row objects if the page holds a table;
+    // for non-table pages, this list will contain a single object
+  ],
   "us_postal_page": "start" | "end" | "none"
 }}
 
@@ -762,14 +814,29 @@ NORMALIZATION (values only)
   • Normalize by trimming whitespace, ignoring case, collapsing repeated spaces, and removing punctuation.
   • Treat minor variations (extra spaces, punctuation, middle initials, first/middle/last order) as the same person.
 
+IDENTIFIER KEYS (eligible anchors)
+- Exactly these: "Accession ID", "Claim ID", "Subscriber ID", "MR ID", "Patient Name".
+- A non-null value for any of these constitutes an identifier.
+
+TABLE ROW MODEL (CRITICAL)
+- When a page has multiple `data` rows, treat each row-object as a distinct **ITEM** with its own identifiers.
+- You MUST emit **one classification per ITEM** even if they originate from the same page.
+- Prefer to anchor an ITEM by the first non-null identifier in this priority order (if multiple present in the same row):
+  1) Claim ID  2) Accession ID  3) MR ID  4) Subscriber ID  5) Patient Name
+  (This priority is ONLY for choosing the row's ANCHOR; all identifiers still go into the association table.)
+- **Page duplication rule (allowed exception):** A multi-row page MAY contribute to multiple documents simultaneously (one per ITEM). This is the ONLY exception to the “every page belongs to exactly one document” rule.
+
 ANCHORING & ASSOCIATION TABLE (no priorities)
-- When a document begins, set ANCHOR = the first identifier key/value actually observed on that start page (any of: Accession ID, Patient Name, Claim ID, MR ID, Subscriber ID).
-- Maintain an association table for the active document: all identifier key/value pairs seen together with the ANCHOR (e.g., Accession ID ↔ Patient Name/Claim ID/MR ID/Subscriber ID). Add to this table as new identifiers co-occur on subsequent pages.
-- **Mandatory consistency rule:** If any identifier key already present in the association table later appears with a DIFFERENT value (e.g., same key "Claim ID" but a new value), you MUST start a new document. Postal/text cues cannot override this.
+- For a non-table page (single row in `data`), when a document begins, set ANCHOR = the first identifier key/value observed on that start page.
+- Maintain an association table for the active document: all identifier key/value pairs seen together with the ANCHOR. Add to this table as new identifiers co-occur on subsequent pages.
+- For a table page:
+  • Build a **separate temporary association** per ITEM (per row) using that row's identifiers.
+  • Each ITEM starts/extends its **own** document thread according to the rules below.
+- **Mandatory consistency rule:** If any identifier key already present in a document’s association table later appears with a DIFFERENT value, you MUST start a new document. Postal/text cues cannot override this.
 
 POSTAL-AWARE RULES (use us_postal_page wisely)
 - If page.us_postal_page == "start":
-  • Treat as a **strong start signal**. Start a NEW document **unless** the page clearly presents the current ANCHOR or an identifier already in the active association table (in that case, keep it with the active document).
+  • Treat as a **strong start signal**. Start a NEW document **unless** the page clearly presents the current ANCHOR or an identifier already in that document’s association table (then keep it with the active document).
   • If the page has **no identifiers**, prefer to start a new document; if tie with adjacent groups exists, apply the tie-break workflow below.
 - If page.us_postal_page == "end":
   • Treat as a **strong end signal** for the **current** document **if** the page shows the current ANCHOR or any identifier in the active association table (attach it, then close the document).
@@ -782,15 +849,15 @@ CONTINUE same document if:
   • The page lacks ANCHOR but presents any identifier key/value already in the current document’s association table.
 
 START a NEW document if (HARD SPLIT RULES):
-  • **Same ANCHOR key but a DIFFERENT value appears** (e.g., ANCHOR=Claim ID: X and current page shows Claim ID: Y) → **force a new document**. No postal or text cue can override this.
-  • **Any identifier key already in the association table appears later with a DIFFERENT value** (e.g., Patient Name changes, MR ID changes, Subscriber ID changes) → **force a new document**.
+  • **Same ANCHOR key but a DIFFERENT value appears** → **force a new document** (no postal/text cue can override).
+  • **Any identifier key already in the association table appears later with a DIFFERENT value** → **force a new document**.
   • The page shows an ANCHOR key/value different from the current ANCHOR, OR
   • The page (even without the ANCHOR key) presents ANY identifier key/value that is NOT in the current document’s association table — treat this as a completely NEW ANCHOR, OR
   • us_postal_page == "start" and identifiers are absent or conflict with the active association table, OR
   • No identifiers are present and tie-breaker text rules (below) clearly attach the page forward to a different upcoming anchored group.
 
 USING raw_text AS A SECONDARY TIE-BREAKER (never against a stable ANCHOR)
-Use ONLY when a page has no identifiers OR identifiers are insufficient to decide (e.g., leading/trailing runs, between two anchored groups, or competing associations). If an ANCHOR is present and unchanged, DO NOT split based solely on text.
+Use ONLY when a page has no identifiers OR identifiers are insufficient to decide. If an ANCHOR is present and unchanged, DO NOT split based solely on text.
 
 Textual cues (non-exhaustive):
 - Prominent header/title strings (e.g., payer plan names, "EOB", "Statement", "Authorization").
@@ -802,7 +869,7 @@ Tie-break workflow for no-ID pages:
 1) Identify the ACTIVE left document (most recent anchored page before this page). Identify the nearest right anchor page R (first future page with any identifier). Build windows:
    • Left window: last ≤2 pages of the active document that have raw_text.
    • Right window: pages from R through R+4 (max 5 pages), OR until encountering a page whose identifiers belong to a different anchor than R — whichever comes first. Include no-ID pages in this window.
-2) If the current page contains a header phrase that appears in the RIGHT window but NOT in the LEFT window, ATTACH FORWARD to the right document (it may be on any of the first ≤5 right-group pages, not necessarily the first page).
+2) If the current page contains a header phrase that appears in the RIGHT window but NOT in the LEFT window, ATTACH FORWARD to the right document.
 3) Otherwise, compare lightweight similarity (token overlap) of the current page’s raw_text against the LEFT and RIGHT windows; attach to the side with clearly higher similarity.
 4) If similarity is inconclusive, keep with the active (left) document to preserve continuity.
 5) Page-number reset cues strengthen a forward split only when identifiers are absent/ambiguous. They never override a stable, matching ANCHOR.
@@ -810,15 +877,13 @@ Tie-break workflow for no-ID pages:
    • If current page has us_postal_page == "start" and no identifiers, prefer attaching FORWARD unless strong LEFT similarity exists.
    • If current page has us_postal_page == "end" and no identifiers, prefer attaching BACK to the active document unless strong RIGHT similarity exists.
 
-ASSIGNMENT GUARANTEES FOR NO-ID Pages
-- Every page must belong to exactly one document.
-- Leading no-ID pages attach forward to the first anchored document (use the tie-break workflow if multiple candidates). Postal "start" strengthens a forward attachment.
-- Interstitial no-ID pages stay with the active document unless the tie-break workflow indicates a better match to the imminent next document. Postal "end" strengthens a backward attachment.
-- Trailing no-ID pages attach back to the last active document.
+ASSIGNMENT GUARANTEES
+- Every ITEM must yield exactly one document classification.
+- Leading/trailing/interstitial no-ID pages attach according to the tie-break workflow above.
+- **Multi-row pages:** The same physical page may be associated with multiple ITEM-based documents as needed to satisfy the “one classification per ITEM” rule.
 
 ANCHOR REQUIREMENT (mandatory)
-- **Never output a document that lacks at least ONE anchor identifier** in its consolidated data. The permitted anchors are exactly:
-  "Accession ID", "Claim ID", "Subscriber ID", "MR ID", or "Patient Name".
+- **Never output a document that lacks at least ONE anchor identifier** in its consolidated data. Permitted anchors: "Accession ID", "Claim ID", "Subscriber ID", "MR ID", "Patient Name".
 - If a provisional group would close without any of these anchors, use the tie-break workflow to attach its pages to the nearest anchored group. Only emit documents that contain ≥1 anchor identifier.
 
 CONSOLIDATING DATA PER DOCUMENT
@@ -832,9 +897,7 @@ GROUP-LEVEL DOC TYPE DETERMINATION (MUST use ALL pages in the group)
 - For each group, construct:
   • group_text = the concatenation of raw_text from ALL pages in the group (order-preserved).
   • group_data = the consolidated DATA for the group (from "CONSOLIDATING DATA PER DOCUMENT").
-- Choose the single best-fitting label (from the taxonomy below) by semantically matching group_text (titles, reasons, outcomes, decisions, amounts) and corroborating with group_data. NEVER select doc_type based on a single page if other pages in the same group add clarifying or contradicting context.
-
-
+- Choose the single best-fitting label (from the taxonomy below) by semantically matching group_text (titles, reasons, outcomes, decisions, amounts) and corroborating with group_data. NEVER select doc_type based on a single page if other pages add clarifying or contradicting context.
 
 ALIAS CUES (map common phrases → exact taxonomy labels; not exhaustive)
 - Any of: "negative balance", "refund", "refund requested", "refund due", "request refund"
@@ -844,24 +907,20 @@ ALIAS CUES (map common phrases → exact taxonomy labels; not exhaustive)
   "service is considered investigational or experimental",
   "you have exhausted your appeal rights"
   → Correspondence: Final Internal Appeal Denial
-
 - Any of: "dispute has already undergone the initial appeal",
   "final appeal has already been completed",
   "no further avenue of appeal is available",
   "no further review has been done",
   "appeal not eligible for review"
   → Correspondence: Appeal Not Eligible for Review
-  
-- Any of: "patient death", "death","passed away", "deceased","Obituary", "death certificate" → Correspondence: Death: Notification patient passed away
+- Any of: "patient death", "death", "passed away", "deceased", "Obituary", "death certificate" → Correspondence: Death: Notification patient passed away
 - Any of: "EOB", "EOP", "Explanation of Benefits", "no payment", "paid $0", "zero amount" → Correspondence: EOB: Zero pay EOB
 - Any of: "payment made to Guardant", "paid to Guardant Health", "explanation of payment", "EOP payment" → Correspondence: Explanation of payment: Payment made to: Guardant Health
-- Any of: "request for medical records", "records request", "lab report request", "send medical records" → Correspondence: Received: Medical Records  (or a more specific Medical Records subtype below if clearly stated)
-- Any of: "timely filing appeal", or any **timely filing content that explicitly references an APPEAL** (e.g., "appeal upheld due to late filing", "right to submit second level request/appeal") → Correspondence: Timely Filing: Timely filing of an Appeal
-- Any of: "timely filing claim", or any **timely filing content that explicitly references a CLAIM** (e.g., "claim past filing deadline", "claim not paid due to filing beyond 365 days") → Correspondence: Timely Filing: Timely filing of an Claim
-- Any of: "timely filing external appeal", or any **timely filing content that explicitly references an EXTERNAL APPEAL** (e.g., "external appeal denied due to late submission") → Correspondence: Timely Filing: Timely filing of an External Appeal
+- Any of: "request for medical records", "records request", "lab report request", "send medical records" → Correspondence: Received: Medical Records
+- Any of: "timely filing appeal", or timely filing content that explicitly references an APPEAL → Correspondence: Timely Filing: Timely filing of an Appeal
+- Any of: "timely filing claim", or timely filing content that explicitly references a CLAIM → Correspondence: Timely Filing: Timely filing of an Claim
+- Any of: "timely filing external appeal", or timely filing content that explicitly references an EXTERNAL APPEAL → Correspondence: Timely Filing: Timely filing of an External Appeal
 - Any of: "submit additional information", "timely submission of requested information" → Correspondence: Timely Filing: Timely submission of requested additional information
-
-
 
 DOC TYPE (taxonomy-driven; MUST be exactly one of the labels below)
 - Correspondence: Appeal Denial: Next step internal appeal
@@ -923,11 +982,11 @@ DOC TYPE (taxonomy-driven; MUST be exactly one of the labels below)
 - Correspondence: Appeal Not Eligible for Review
 
 - Conflict resolution:
-  • Prefer explicit outcome/decision phrases that appear anywhere in group_text (e.g., "final internal appeal denial", "authorization denied/approved", "refund request withdrawal", "payment made to Guardant Health", "zero payment").
-  • If multiple candidate labels appear, pick the most specific outcome-oriented one that matches the dominant cues across the group.
-  • If denial language includes a clear final decision with reasoning AND states appeal rights are exhausted (no further recourse), classify as "Correspondence: Final Internal Appeal Denial".
-  • If the correspondence explicitly states that all appeal levels have already been completed AND no further review has been done (the current request was not evaluated), classify as "Correspondence: Appeal Not Eligible for Review".
-  • If timeliness is the primary topic AND there is NO second-level/next-step appeal instruction, classify under the appropriate Timely Filing label (typically "Correspondence: Timely Filing: Timely filing of an Appeal" when it explicitly references an appeal).
+  • Prefer explicit outcome/decision phrases that appear anywhere in group_text.
+  • If multiple candidate labels appear, pick the most specific outcome-oriented one matching the dominant cues across the group.
+  • If denial language states appeal rights are exhausted, classify as "Correspondence: Final Internal Appeal Denial".
+  • If correspondence says all appeal levels are already completed and current request was not evaluated, classify as "Correspondence: Appeal Not Eligible for Review".
+  • If timeliness is primary and there is NO second-level/next-step instruction, choose the appropriate Timely Filing label.
 
 OUTPUT FORMAT
 Return exactly:
@@ -936,13 +995,17 @@ Return exactly:
     {{
       "t": "<ONE exact label from the taxonomy above>",
       "pt": "<start-end>",
-      "s" : <two lines summary on what the grouped pages classify as, using group_text + grouped DATA>,
+      "s" : "<two lines summary on what the grouped pages classify as, using group_text + grouped DATA>",
       "d": {{
         // Include ONLY keys that have non-null values after consolidation.
       }}
     }}
   ]
 }}
+
+MULTI-ROW EXAMPLE EXPECTATION
+- If a page (or grouped set) yields Claim ID values ["UB87401E20250507","UB87401E20250513","UB87401E20250427"] in separate data rows,
+  you MUST output **three** separate entries in "documents" — one per Claim ID (and corresponding row identifiers).
 
 Now classify: {pages_data}"""
 
